@@ -12,7 +12,7 @@ import smtplib
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 
 load_dotenv()
 
@@ -28,7 +28,11 @@ FLOW_SECRET_KEY = os.getenv("FLOW_SECRET_KEY", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DOWNLOAD_BASE_URL = os.getenv("DOWNLOAD_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
 
+# Archivo local (fallback)
 PRODUCT_FILE = os.getenv("PRODUCT_FILE", "products/pack_ia_pymes_2026.zip")
+
+# Link Drive (nuevo)
+PRODUCT_DRIVE_URL = os.getenv("PRODUCT_DRIVE_URL", "").strip()
 
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -177,7 +181,7 @@ def send_email(to_email: str, subject: str, body: str):
 
     # Si no hay SMTP configurado, solo loguea
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        print("[EMAIL SKIPPED] SMTP no configurado. Para:", to_email, "Link:", body)
+        print("[EMAIL SKIPPED] SMTP no configurado. Para:", to_email, "Body:", body)
         return
 
     msg = EmailMessage()
@@ -202,7 +206,8 @@ def health():
         "service": "flow-backend",
         "flow_api_url": FLOW_API_URL,
         "public_base_url": PUBLIC_BASE_URL,
-        "download_base_url": DOWNLOAD_BASE_URL
+        "download_base_url": DOWNLOAD_BASE_URL,
+        "has_product_drive_url": bool(PRODUCT_DRIVE_URL)
     }
 
 
@@ -263,29 +268,30 @@ async def flow_confirmation(request: Request, background_tasks: BackgroundTasks)
     # Buscar la orden local
     order = db_get_by_flow_token(token)
     if not order:
-        # Igual responde 200 para que Flow no reintente eternamente
         return JSONResponse({"ok": True, "warn": "order_not_found"}, status_code=200)
 
     _order_id, order_email, order_status, existing_download_token = order
 
-    # Idempotencia: si Flow dice pagado, aseguramos download_token UNA sola vez
     if st == 2:
         if existing_download_token:
             download_token = existing_download_token
         else:
-            download_token = uuid.uuid4().hex  # 32 chars
+            download_token = uuid.uuid4().hex
             db_mark_paid(token, download_token)
 
+        # Link que irá al correo: SIEMPRE tu backend /download/{token}
+        # Luego ese endpoint redirige a Drive (si está configurado).
         download_link = f"{DOWNLOAD_BASE_URL}/download/{download_token}"
+
         mail_subject = "Tu Pack IA para PYMES 2026 — Link de descarga"
         mail_body = (
             "¡Gracias por tu compra!\n\n"
-            f"Aquí está tu link de descarga:\n{download_link}\n\n"
+            "Aquí está tu link de descarga:\n"
+            f"{download_link}\n\n"
             "Si tienes problemas, responde a este correo.\n"
             "— Flujos Digitales"
         )
 
-        # IMPORTANTE: enviamos al email guardado en la DB (el que viene del formulario)
         background_tasks.add_task(send_email, order_email, mail_subject, mail_body)
 
     return JSONResponse({"ok": True}, status_code=200)
@@ -323,6 +329,11 @@ def download(download_token: str):
     if int(status) != 2:
         raise HTTPException(status_code=403, detail="Pago no confirmado")
 
+    # ✅ Si hay link de Drive, redirige ahí (lo que quieres)
+    if PRODUCT_DRIVE_URL:
+        return RedirectResponse(url=PRODUCT_DRIVE_URL, status_code=302)
+
+    # Fallback: descarga archivo local si no configuraste Drive
     if not os.path.exists(PRODUCT_FILE):
         raise HTTPException(status_code=500, detail=f"No existe el archivo del producto: {PRODUCT_FILE}")
 
