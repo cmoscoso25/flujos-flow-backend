@@ -281,7 +281,8 @@ async def flow_confirmation(request: Request, background_tasks: BackgroundTasks)
 
         # Link que irá al correo: SIEMPRE tu backend /download/{token}
         # Luego ese endpoint redirige a Drive (si está configurado).
-        download_link = f"{DOWNLOAD_BASE_URL}/download/{download_token}"
+        download_link = os.getenv("PRODUCT_DRIVE_URL")
+
 
         mail_subject = "Tu Pack IA para PYMES 2026 — Link de descarga"
         mail_body = (
