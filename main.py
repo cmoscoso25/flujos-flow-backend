@@ -22,8 +22,8 @@ app = FastAPI(title="flow-backend")
 # Config
 # =========================
 FLOW_API_URL = os.getenv("FLOW_API_URL", "https://sandbox.flow.cl/api").rstrip("/")
-FLOW_API_KEY = os.getenv("FLOW_API_KEY", "")
-FLOW_SECRET_KEY = os.getenv("FLOW_SECRET_KEY", "")
+FLOW_API_KEY = os.getenv("FLOW_API_KEY", "").strip()
+FLOW_SECRET_KEY = os.getenv("FLOW_SECRET_KEY", "").strip()
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DOWNLOAD_BASE_URL = os.getenv("DOWNLOAD_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
@@ -32,13 +32,13 @@ DOWNLOAD_BASE_URL = os.getenv("DOWNLOAD_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
 PRODUCT_FILE = os.getenv("PRODUCT_FILE", "products/pack_ia_pymes_2026.zip")
 
 # Link Drive (nuevo)
-PRODUCT_DRIVE_URL = os.getenv("PRODUCT_DRIVE_URL", "").strip()
+PRODUCT_DRIVE_URL = (os.getenv("PRODUCT_DRIVE_URL") or "").strip()
 
-SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_HOST = (os.getenv("SMTP_HOST") or "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER)
+SMTP_USER = (os.getenv("SMTP_USER") or "").strip()
+SMTP_PASS = (os.getenv("SMTP_PASS") or "").strip()
+FROM_EMAIL = (os.getenv("FROM_EMAIL") or SMTP_USER).strip()
 
 DB_PATH = "orders.db"
 
@@ -179,7 +179,7 @@ def send_email(to_email: str, subject: str, body: str):
         print("[EMAIL SKIPPED] to_email vacío. Body:", body)
         return
 
-    # Si no hay SMTP configurado, solo loguea
+    # Si no hay SMTP configurado, solo loguea (para que no “muera” el webhook)
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
         print("[EMAIL SKIPPED] SMTP no configurado. Para:", to_email, "Body:", body)
         return
@@ -207,7 +207,8 @@ def health():
         "flow_api_url": FLOW_API_URL,
         "public_base_url": PUBLIC_BASE_URL,
         "download_base_url": DOWNLOAD_BASE_URL,
-        "has_product_drive_url": bool(PRODUCT_DRIVE_URL)
+        "has_product_drive_url": bool(PRODUCT_DRIVE_URL),
+        "smtp_configured": bool(SMTP_HOST and SMTP_USER and SMTP_PASS),
     }
 
 
@@ -273,16 +274,16 @@ async def flow_confirmation(request: Request, background_tasks: BackgroundTasks)
     _order_id, order_email, order_status, existing_download_token = order
 
     if st == 2:
+        # Idempotencia: si ya está pagado, reutiliza token existente
         if existing_download_token:
             download_token = existing_download_token
         else:
             download_token = uuid.uuid4().hex
             db_mark_paid(token, download_token)
 
-        # Link que irá al correo: SIEMPRE tu backend /download/{token}
-        # Luego ese endpoint redirige a Drive (si está configurado).
-        download_link = os.getenv("PRODUCT_DRIVE_URL")
-
+        # ✅ SIEMPRE enviamos link del backend (estable y controlado)
+        # Ese endpoint redirige a Drive si PRODUCT_DRIVE_URL está configurado.
+        download_link = f"{DOWNLOAD_BASE_URL}/download/{download_token}"
 
         mail_subject = "Tu Pack IA para PYMES 2026 — Link de descarga"
         mail_body = (
