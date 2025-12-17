@@ -22,8 +22,8 @@ app = FastAPI(title="flow-backend")
 # Config
 # =========================
 FLOW_API_URL = os.getenv("FLOW_API_URL", "https://sandbox.flow.cl/api").rstrip("/")
-FLOW_API_KEY = os.getenv("FLOW_API_KEY", "").strip()
-FLOW_SECRET_KEY = os.getenv("FLOW_SECRET_KEY", "").strip()
+FLOW_API_KEY = os.getenv("FLOW_API_KEY", "")
+FLOW_SECRET_KEY = os.getenv("FLOW_SECRET_KEY", "")
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DOWNLOAD_BASE_URL = os.getenv("DOWNLOAD_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
@@ -32,26 +32,24 @@ DOWNLOAD_BASE_URL = os.getenv("DOWNLOAD_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
 PRODUCT_FILE = os.getenv("PRODUCT_FILE", "products/pack_ia_pymes_2026.zip")
 
 # Link Drive (nuevo)
-PRODUCT_DRIVE_URL = (os.getenv("PRODUCT_DRIVE_URL") or "").strip()
+PRODUCT_DRIVE_URL = os.getenv("PRODUCT_DRIVE_URL", "").strip()
 
-SMTP_HOST = (os.getenv("SMTP_HOST") or "").strip()
+# SMTP
+SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = (os.getenv("SMTP_USER") or "").strip()
-SMTP_PASS = (os.getenv("SMTP_PASS") or "").strip()
-FROM_EMAIL = (os.getenv("FROM_EMAIL") or SMTP_USER).strip()
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER)
 
 DB_PATH = "orders.db"
-
 
 # =========================
 # Utils
 # =========================
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-
 def is_valid_email(email: str) -> bool:
     return bool(email and EMAIL_REGEX.match(email))
-
 
 # =========================
 # DB (simple)
@@ -74,9 +72,7 @@ def db_init():
         con.execute("CREATE INDEX IF NOT EXISTS idx_orders_download_token ON orders(download_token)")
         con.commit()
 
-
 db_init()
-
 
 def db_create_order(order_id: str, email: str, commerce_order: str, flow_token: str):
     with sqlite3.connect(DB_PATH) as con:
@@ -89,7 +85,6 @@ def db_create_order(order_id: str, email: str, commerce_order: str, flow_token: 
         )
         con.commit()
 
-
 def db_get_by_flow_token(flow_token: str):
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute(
@@ -97,7 +92,6 @@ def db_get_by_flow_token(flow_token: str):
             (flow_token,)
         )
         return cur.fetchone()
-
 
 def db_mark_paid(flow_token: str, download_token: str):
     with sqlite3.connect(DB_PATH) as con:
@@ -111,7 +105,6 @@ def db_mark_paid(flow_token: str, download_token: str):
         )
         con.commit()
 
-
 def db_get_by_download_token(download_token: str):
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute(
@@ -119,7 +112,6 @@ def db_get_by_download_token(download_token: str):
             (download_token,)
         )
         return cur.fetchone()
-
 
 # =========================
 # Flow signing (official)
@@ -129,7 +121,6 @@ def flow_sign(params: dict, secret_key: str) -> str:
     items = sorted(params.items(), key=lambda x: x[0])
     to_sign = "".join([f"{k}{v}" for k, v in items])
     return hmac.new(secret_key.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-
 
 def flow_post(endpoint: str, params: dict) -> dict:
     if not FLOW_API_KEY or not FLOW_SECRET_KEY:
@@ -155,7 +146,6 @@ def flow_post(endpoint: str, params: dict) -> dict:
     except Exception:
         raise HTTPException(status_code=400, detail=f"Flow response no-JSON: {resp.text}")
 
-
 def flow_get_status(token: str) -> dict:
     params = {"apiKey": FLOW_API_KEY, "token": token}
     params["s"] = flow_sign(params, FLOW_SECRET_KEY)
@@ -170,18 +160,17 @@ def flow_get_status(token: str) -> dict:
     except Exception:
         raise HTTPException(status_code=400, detail=f"Flow status response no-JSON: {resp.text}")
 
-
 # =========================
-# Email (optional)
+# Email
 # =========================
 def send_email(to_email: str, subject: str, body: str):
     if not to_email:
         print("[EMAIL SKIPPED] to_email vacío. Body:", body)
         return
 
-    # Si no hay SMTP configurado, solo loguea (para que no “muera” el webhook)
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        print("[EMAIL SKIPPED] SMTP no configurado. Para:", to_email, "Body:", body)
+        print("[EMAIL SKIPPED] SMTP no configurado. Para:", to_email)
+        print("[EMAIL BODY]\n", body)
         return
 
     msg = EmailMessage()
@@ -190,11 +179,15 @@ def send_email(to_email: str, subject: str, body: str):
     msg["Subject"] = subject
     msg.set_content(body)
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
-
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        print("[EMAIL SENT] Para:", to_email)
+    except Exception as e:
+        print("[EMAIL ERROR]", repr(e))
+        # No lanzamos excepción para no romper la confirmación a Flow
 
 # =========================
 # Endpoints
@@ -208,9 +201,8 @@ def health():
         "public_base_url": PUBLIC_BASE_URL,
         "download_base_url": DOWNLOAD_BASE_URL,
         "has_product_drive_url": bool(PRODUCT_DRIVE_URL),
-        "smtp_configured": bool(SMTP_HOST and SMTP_USER and SMTP_PASS),
+        "smtp_configured": bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
     }
-
 
 @app.post("/pay/create")
 async def pay_create(payload: dict):
@@ -250,7 +242,6 @@ async def pay_create(payload: dict):
 
     return {"ok": True, "checkoutUrl": checkout_url, "token": flow_token}
 
-
 @app.post("/flow/confirmation")
 async def flow_confirmation(request: Request, background_tasks: BackgroundTasks):
     """
@@ -262,27 +253,23 @@ async def flow_confirmation(request: Request, background_tasks: BackgroundTasks)
     if not token:
         return JSONResponse({"ok": False, "error": "missing token"}, status_code=200)
 
-    # Consultar estado real
     status = flow_get_status(token)
     st = int(status.get("status", 0))  # 1 pendiente, 2 pagada, 3 rechazada, 4 anulada
 
-    # Buscar la orden local
     order = db_get_by_flow_token(token)
     if not order:
         return JSONResponse({"ok": True, "warn": "order_not_found"}, status_code=200)
 
-    _order_id, order_email, order_status, existing_download_token = order
+    _order_id, order_email, _order_status, existing_download_token = order
 
     if st == 2:
-        # Idempotencia: si ya está pagado, reutiliza token existente
         if existing_download_token:
             download_token = existing_download_token
         else:
             download_token = uuid.uuid4().hex
             db_mark_paid(token, download_token)
 
-        # ✅ SIEMPRE enviamos link del backend (estable y controlado)
-        # Ese endpoint redirige a Drive si PRODUCT_DRIVE_URL está configurado.
+        # ✅ Link único del backend (recomendado)
         download_link = f"{DOWNLOAD_BASE_URL}/download/{download_token}"
 
         mail_subject = "Tu Pack IA para PYMES 2026 — Link de descarga"
@@ -297,7 +284,6 @@ async def flow_confirmation(request: Request, background_tasks: BackgroundTasks)
         background_tasks.add_task(send_email, order_email, mail_subject, mail_body)
 
     return JSONResponse({"ok": True}, status_code=200)
-
 
 @app.post("/flow/return")
 async def flow_return(request: Request):
@@ -320,7 +306,6 @@ async def flow_return(request: Request):
     else:
         return JSONResponse({"ok": False, "message": "Pago no completado (rechazado/anulado)."})
 
-
 @app.get("/download/{download_token}")
 def download(download_token: str):
     row = db_get_by_download_token(download_token)
@@ -331,11 +316,11 @@ def download(download_token: str):
     if int(status) != 2:
         raise HTTPException(status_code=403, detail="Pago no confirmado")
 
-    # ✅ Si hay link de Drive, redirige ahí (lo que quieres)
+    # ✅ Si hay link de Drive, redirige ahí
     if PRODUCT_DRIVE_URL:
         return RedirectResponse(url=PRODUCT_DRIVE_URL, status_code=302)
 
-    # Fallback: descarga archivo local si no configuraste Drive
+    # Fallback: descarga archivo local
     if not os.path.exists(PRODUCT_FILE):
         raise HTTPException(status_code=500, detail=f"No existe el archivo del producto: {PRODUCT_FILE}")
 
