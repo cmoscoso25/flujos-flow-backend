@@ -31,14 +31,21 @@ DOWNLOAD_BASE_URL = os.getenv("DOWNLOAD_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
 # Archivo local (fallback)
 PRODUCT_FILE = os.getenv("PRODUCT_FILE", "products/pack_ia_pymes_2026.zip")
 
-# Link Drive (nuevo)
-PRODUCT_DRIVE_URL = (os.getenv("PRODUCT_DRIVE_URL", "") or "").strip()
+# Link Drive (redirect final)
+PRODUCT_DRIVE_URL = os.getenv("PRODUCT_DRIVE_URL", "").strip()
 
-SMTP_HOST = (os.getenv("SMTP_HOST", "") or "").strip()
+# Email provider (recomendado en Render: API HTTP)
+EMAIL_PROVIDER = (os.getenv("EMAIL_PROVIDER", "smtp") or "smtp").strip().lower()
+
+# Resend (HTTP)
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+FROM_EMAIL = os.getenv("FROM_EMAIL", "").strip()  # Ej: "Flujos Digitales <onboarding@resend.dev>"
+
+# SMTP (fallback; en Render suele fallar)
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = (os.getenv("SMTP_USER", "") or "").strip()
-SMTP_PASS = (os.getenv("SMTP_PASS", "") or "").strip()
-FROM_EMAIL = (os.getenv("FROM_EMAIL", "") or SMTP_USER).strip()
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
 
 DB_PATH = "orders.db"
 
@@ -47,17 +54,12 @@ DB_PATH = "orders.db"
 # =========================
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-
 def is_valid_email(email: str) -> bool:
     return bool(email and EMAIL_REGEX.match(email))
 
 
-def smtp_is_configured() -> bool:
-    return bool(SMTP_HOST and SMTP_USER and SMTP_PASS and FROM_EMAIL)
-
-
 # =========================
-# DB (simple)
+# DB
 # =========================
 def db_init():
     with sqlite3.connect(DB_PATH) as con:
@@ -77,9 +79,7 @@ def db_init():
         con.execute("CREATE INDEX IF NOT EXISTS idx_orders_download_token ON orders(download_token)")
         con.commit()
 
-
 db_init()
-
 
 def db_create_order(order_id: str, email: str, commerce_order: str, flow_token: str):
     with sqlite3.connect(DB_PATH) as con:
@@ -92,7 +92,6 @@ def db_create_order(order_id: str, email: str, commerce_order: str, flow_token: 
         )
         con.commit()
 
-
 def db_get_by_flow_token(flow_token: str):
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute(
@@ -100,7 +99,6 @@ def db_get_by_flow_token(flow_token: str):
             (flow_token,)
         )
         return cur.fetchone()
-
 
 def db_mark_paid(flow_token: str, download_token: str):
     with sqlite3.connect(DB_PATH) as con:
@@ -114,7 +112,6 @@ def db_mark_paid(flow_token: str, download_token: str):
         )
         con.commit()
 
-
 def db_get_by_download_token(download_token: str):
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute(
@@ -124,30 +121,13 @@ def db_get_by_download_token(download_token: str):
         return cur.fetchone()
 
 
-def db_last_orders(limit: int = 10):
-    with sqlite3.connect(DB_PATH) as con:
-        cur = con.execute(
-            """
-            SELECT created_at, email, status, flow_token, download_token, paid_at
-            FROM orders
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (limit,)
-        )
-        rows = cur.fetchall()
-        return rows
-
-
 # =========================
-# Flow signing (official)
-# sort keys asc, concat key+value, HMAC SHA256 hex
+# Flow signing
 # =========================
 def flow_sign(params: dict, secret_key: str) -> str:
     items = sorted(params.items(), key=lambda x: x[0])
     to_sign = "".join([f"{k}{v}" for k, v in items])
     return hmac.new(secret_key.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-
 
 def flow_post(endpoint: str, params: dict) -> dict:
     if not FLOW_API_KEY or not FLOW_SECRET_KEY:
@@ -165,6 +145,7 @@ def flow_post(endpoint: str, params: dict) -> dict:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=20
     )
+
     if resp.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Flow error: {resp.text}")
 
@@ -172,7 +153,6 @@ def flow_post(endpoint: str, params: dict) -> dict:
         return resp.json()
     except Exception:
         raise HTTPException(status_code=400, detail=f"Flow response no-JSON: {resp.text}")
-
 
 def flow_get_status(token: str) -> dict:
     params = {"apiKey": FLOW_API_KEY, "token": token}
@@ -190,37 +170,64 @@ def flow_get_status(token: str) -> dict:
 
 
 # =========================
-# Email
+# Email senders
 # =========================
+def send_email_via_resend(to_email: str, subject: str, text_body: str):
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY no configurada")
+    if not FROM_EMAIL:
+        raise RuntimeError("FROM_EMAIL no configurado (ej: Flujos Digitales <onboarding@resend.dev>)")
+
+    resp = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "subject": subject,
+            "text": text_body,
+        },
+        timeout=20
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"Resend error {resp.status_code}: {resp.text}")
+
+def send_email_via_smtp(to_email: str, subject: str, body: str):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        raise RuntimeError("SMTP no configurado")
+
+    msg = EmailMessage()
+    msg["From"] = SMTP_USER
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+
 def send_email(to_email: str, subject: str, body: str):
-    print(f"[EMAIL] Attempt -> to={to_email} subject={subject}")
-
     if not to_email:
-        print("[EMAIL] SKIP: to_email vacío")
-        return
-
-    if not smtp_is_configured():
-        print("[EMAIL] ERROR: SMTP no configurado (HOST/USER/PASS/FROM). No se envía.")
+        print("[EMAIL] SKIPPED: to_email vacío")
         return
 
     try:
-        msg = EmailMessage()
-        msg["From"] = FROM_EMAIL
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        msg.set_content(body)
+        if EMAIL_PROVIDER == "resend":
+            send_email_via_resend(to_email, subject, body)
+            print(f"[EMAIL] SENT via RESEND -> {to_email}")
+            return
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
-
-        print("[EMAIL] SENT OK")
+        # fallback SMTP
+        send_email_via_smtp(to_email, subject, body)
+        print(f"[EMAIL] SENT via SMTP -> {to_email}")
 
     except Exception as e:
-        print("[EMAIL] FAILED:", repr(e))
+        # Importante: no romper la confirmación a Flow por error de correo
+        print(f"[EMAIL] FAILED to={to_email} provider={EMAIL_PROVIDER} err={repr(e)}")
 
 
 # =========================
@@ -228,6 +235,9 @@ def send_email(to_email: str, subject: str, body: str):
 # =========================
 @app.get("/health")
 def health():
+    smtp_configured = bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
+    resend_configured = bool(RESEND_API_KEY and FROM_EMAIL)
+
     return {
         "ok": True,
         "service": "flow-backend",
@@ -235,46 +245,18 @@ def health():
         "public_base_url": PUBLIC_BASE_URL,
         "download_base_url": DOWNLOAD_BASE_URL,
         "has_product_drive_url": bool(PRODUCT_DRIVE_URL),
-        "smtp_configured": smtp_is_configured(),
-        "smtp_host": bool(SMTP_HOST),
-        "smtp_user": bool(SMTP_USER),
-        "from_email": bool(FROM_EMAIL),
+        "email_provider": EMAIL_PROVIDER,
+        "smtp_configured": smtp_configured,
+        "resend_configured": resend_configured,
     }
-
-
-@app.get("/debug/test-email")
-def debug_test_email(to: str):
-    """
-    Prueba SMTP sin depender de Flow.
-    """
-    if not is_valid_email(to):
-        raise HTTPException(status_code=400, detail="Email inválido")
-
-    subject = "TEST — Flujos Digitales SMTP"
-    body = "Si llegó este correo, tu SMTP en Render está funcionando ✅"
-    send_email(to, subject, body)
-
-    return {"ok": True, "message": f"Intento de envío ejecutado a {to}. Revisa Render Logs y tu bandeja."}
-
-
-@app.get("/debug/last-orders")
-def debug_last_orders(limit: int = 10):
-    rows = db_last_orders(limit=max(1, min(limit, 50)))
-    data = []
-    for (created_at, email, status, flow_token, download_token, paid_at) in rows:
-        data.append({
-            "created_at": created_at,
-            "email": email,
-            "status": int(status),
-            "flow_token_last6": (flow_token[-6:] if flow_token else None),
-            "has_download_token": bool(download_token),
-            "paid_at": paid_at,
-        })
-    return {"ok": True, "orders": data}
 
 
 @app.post("/pay/create")
 async def pay_create(payload: dict):
+    """
+    payload esperado: {"email":"cliente@correo.cl"}
+    Retorna: {"ok":true, "checkoutUrl":"...","token":"..."}
+    """
     email = (payload.get("email") or "").strip().lower()
     if not is_valid_email(email):
         raise HTTPException(status_code=400, detail="Email inválido o faltante")
@@ -292,7 +274,7 @@ async def pay_create(payload: dict):
         "commerceOrder": commerce_order,
         "subject": "Pack IA para PYMES 2026",
         "currency": "CLP",
-        "amount": 350,
+        "amount": 350,  # <-- precio actual
         "email": email,
         "urlConfirmation": f"{PUBLIC_BASE_URL}/flow/confirmation",
         "urlReturn": f"{PUBLIC_BASE_URL}/flow/return",
@@ -304,30 +286,29 @@ async def pay_create(payload: dict):
     checkout_url = f"{data['url']}?token={flow_token}"
 
     db_create_order(order_id, email, commerce_order, flow_token)
-    print(f"[ORDER] created order_id={order_id} email={email} token_last6={flow_token[-6:]} amount=350")
 
     return {"ok": True, "checkoutUrl": checkout_url, "token": flow_token}
 
 
 @app.post("/flow/confirmation")
 async def flow_confirmation(request: Request, background_tasks: BackgroundTasks):
+    """
+    Flow POST: token=XXXX (application/x-www-form-urlencoded)
+    Debe responder 200 rápido.
+    """
     form = await request.form()
     token = str(form.get("token") or "").strip()
-    print(f"[FLOW] confirmation hit token_last6={(token[-6:] if token else None)}")
-
     if not token:
         return JSONResponse({"ok": False, "error": "missing token"}, status_code=200)
 
     status = flow_get_status(token)
-    st = int(status.get("status", 0))
-    print(f"[FLOW] status token_last6={token[-6:]} status={st}")
+    st = int(status.get("status", 0))  # 1 pendiente, 2 pagada, 3 rechazada, 4 anulada
 
     order = db_get_by_flow_token(token)
     if not order:
-        print("[FLOW] WARN: order_not_found for token")
         return JSONResponse({"ok": True, "warn": "order_not_found"}, status_code=200)
 
-    _order_id, order_email, order_status, existing_download_token = order
+    _order_id, order_email, _order_status, existing_download_token = order
 
     if st == 2:
         if existing_download_token:
@@ -336,7 +317,8 @@ async def flow_confirmation(request: Request, background_tasks: BackgroundTasks)
             download_token = uuid.uuid4().hex
             db_mark_paid(token, download_token)
 
-        # ✅ ESTE ES EL LINK QUE VA AL CORREO (siempre tu backend)
+        # IMPORTANTÍSIMO:
+        # El correo debe llevar TU endpoint, no el Drive directo.
         download_link = f"{DOWNLOAD_BASE_URL}/download/{download_token}"
 
         mail_subject = "Tu Pack IA para PYMES 2026 — Link de descarga"
@@ -348,7 +330,6 @@ async def flow_confirmation(request: Request, background_tasks: BackgroundTasks)
             "— Flujos Digitales"
         )
 
-        print(f"[EMAIL] queue send to={order_email} download_link={download_link}")
         background_tasks.add_task(send_email, order_email, mail_subject, mail_body)
 
     return JSONResponse({"ok": True}, status_code=200)
@@ -356,10 +337,12 @@ async def flow_confirmation(request: Request, background_tasks: BackgroundTasks)
 
 @app.post("/flow/return")
 async def flow_return(request: Request):
+    """
+    Flow POST via browser a urlReturn con token=...
+    Aquí mostramos estado al cliente (simple).
+    """
     form = await request.form()
     token = str(form.get("token") or "").strip()
-    print(f"[FLOW] return hit token_last6={(token[-6:] if token else None)}")
-
     if not token:
         return JSONResponse({"ok": False, "error": "missing token"}, status_code=200)
 
@@ -380,15 +363,15 @@ def download(download_token: str):
     if not row:
         raise HTTPException(status_code=404, detail="Link inválido o expirado")
 
-    email, status, flow_token = row
+    _email, status, _flow_token = row
     if int(status) != 2:
         raise HTTPException(status_code=403, detail="Pago no confirmado")
 
-    # ✅ Si hay link de Drive, redirige ahí
+    # Si hay link de Drive, redirige ahí
     if PRODUCT_DRIVE_URL:
         return RedirectResponse(url=PRODUCT_DRIVE_URL, status_code=302)
 
-    # Fallback: descarga archivo local si no configuraste Drive
+    # Fallback: descarga archivo local
     if not os.path.exists(PRODUCT_FILE):
         raise HTTPException(status_code=500, detail=f"No existe el archivo del producto: {PRODUCT_FILE}")
 
@@ -397,3 +380,18 @@ def download(download_token: str):
         media_type="application/zip",
         filename=os.path.basename(PRODUCT_FILE)
     )
+
+
+# Debug: probar envío email sin Flow
+@app.get("/debug/test-email")
+def debug_test_email(to: str):
+    to_email = (to or "").strip().lower()
+    if not is_valid_email(to_email):
+        raise HTTPException(status_code=400, detail="Email inválido")
+
+    test_link = f"{DOWNLOAD_BASE_URL}/download/TEST_TOKEN_NO_REAL"
+    subject = "TEST — Flujos Digitales Email"
+    body = f"Prueba de envío.\n\nLink (no real): {test_link}\n"
+
+    send_email(to_email, subject, body)
+    return {"ok": True, "message": f"Intento de envío ejecutado a {to_email}. Revisa Render logs y tu bandeja."}
