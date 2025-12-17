@@ -229,7 +229,7 @@ async def pay_create(payload: dict):
         "commerceOrder": commerce_order,
         "subject": "Pack IA para PYMES 2026",
         "currency": "CLP",
-        "amount": 14990,
+        "amount": 350,
         "email": email,
         "urlConfirmation": f"{PUBLIC_BASE_URL}/flow/confirmation",
         "urlReturn": f"{PUBLIC_BASE_URL}/flow/return",
