@@ -13,35 +13,41 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
 app = FastAPI(title="flow-backend")
 
 # =========================
+# CORS (OBLIGATORIO PARA HTML)
+# =========================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # puedes restringir luego a tu dominio
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =========================
 # Config
 # =========================
-FLOW_API_URL = os.getenv("FLOW_API_URL", "https://sandbox.flow.cl/api").rstrip("/")
+FLOW_API_URL = os.getenv("FLOW_API_URL", "https://www.flow.cl/api").rstrip("/")
 FLOW_API_KEY = os.getenv("FLOW_API_KEY", "")
 FLOW_SECRET_KEY = os.getenv("FLOW_SECRET_KEY", "")
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DOWNLOAD_BASE_URL = os.getenv("DOWNLOAD_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
 
-# Archivo local (fallback)
 PRODUCT_FILE = os.getenv("PRODUCT_FILE", "products/pack_ia_pymes_2026.zip")
-
-# Link Drive (redirect final)
 PRODUCT_DRIVE_URL = os.getenv("PRODUCT_DRIVE_URL", "").strip()
 
-# Email provider (recomendado en Render: API HTTP)
 EMAIL_PROVIDER = (os.getenv("EMAIL_PROVIDER", "smtp") or "smtp").strip().lower()
 
-# Resend (HTTP)
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
-FROM_EMAIL = os.getenv("FROM_EMAIL", "").strip()  # Ej: "Flujos Digitales <onboarding@resend.dev>"
+FROM_EMAIL = os.getenv("FROM_EMAIL", "").strip()
 
-# SMTP (fallback; en Render suele fallar)
 SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
@@ -56,7 +62,6 @@ EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 def is_valid_email(email: str) -> bool:
     return bool(email and EMAIL_REGEX.match(email))
-
 
 # =========================
 # DB
@@ -81,18 +86,15 @@ def db_init():
 
 db_init()
 
-def db_create_order(order_id: str, email: str, commerce_order: str, flow_token: str):
+def db_create_order(order_id, email, commerce_order, flow_token):
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
-            """
-            INSERT INTO orders (id, created_at, email, commerce_order, flow_token, status)
-            VALUES (?,?,?,?,?,?)
-            """,
-            (order_id, datetime.utcnow().isoformat(), email, commerce_order, flow_token, 1)
+            "INSERT INTO orders VALUES (?,?,?,?,?,?,?,?)",
+            (order_id, datetime.utcnow().isoformat(), email, commerce_order, flow_token, 1, None, None)
         )
         con.commit()
 
-def db_get_by_flow_token(flow_token: str):
+def db_get_by_flow_token(flow_token):
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute(
             "SELECT id, email, status, download_token FROM orders WHERE flow_token=?",
@@ -100,85 +102,52 @@ def db_get_by_flow_token(flow_token: str):
         )
         return cur.fetchone()
 
-def db_mark_paid(flow_token: str, download_token: str):
+def db_mark_paid(flow_token, download_token):
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
-            """
-            UPDATE orders
-            SET status=2, download_token=?, paid_at=?
-            WHERE flow_token=? AND (status IS NULL OR status != 2 OR download_token IS NULL)
-            """,
+            "UPDATE orders SET status=2, download_token=?, paid_at=? WHERE flow_token=?",
             (download_token, datetime.utcnow().isoformat(), flow_token)
         )
         con.commit()
 
-def db_get_by_download_token(download_token: str):
+def db_get_by_download_token(download_token):
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute(
-            "SELECT email, status, flow_token FROM orders WHERE download_token=?",
+            "SELECT email, status FROM orders WHERE download_token=?",
             (download_token,)
         )
         return cur.fetchone()
 
-
 # =========================
-# Flow signing
+# Flow helpers
 # =========================
-def flow_sign(params: dict, secret_key: str) -> str:
-    items = sorted(params.items(), key=lambda x: x[0])
-    to_sign = "".join([f"{k}{v}" for k, v in items])
-    return hmac.new(secret_key.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+def flow_sign(params, secret):
+    items = sorted(params.items())
+    raw = "".join(f"{k}{v}" for k, v in items)
+    return hmac.new(secret.encode(), raw.encode(), hashlib.sha256).hexdigest()
 
-def flow_post(endpoint: str, params: dict) -> dict:
-    if not FLOW_API_KEY or not FLOW_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="FLOW_API_KEY / FLOW_SECRET_KEY no configuradas en .env")
-
-    params = dict(params)
+def flow_post(endpoint, params):
     params["apiKey"] = FLOW_API_KEY
     params["s"] = flow_sign(params, FLOW_SECRET_KEY)
-
-    encoded = urlencode(params)
-    url = f"{FLOW_API_URL}{endpoint}"
     resp = requests.post(
-        url,
-        data=encoded,
+        f"{FLOW_API_URL}{endpoint}",
+        data=urlencode(params),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=20
     )
+    return resp.json()
 
-    if resp.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Flow error: {resp.text}")
-
-    try:
-        return resp.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"Flow response no-JSON: {resp.text}")
-
-def flow_get_status(token: str) -> dict:
+def flow_get_status(token):
     params = {"apiKey": FLOW_API_KEY, "token": token}
     params["s"] = flow_sign(params, FLOW_SECRET_KEY)
-
-    url = f"{FLOW_API_URL}/payment/getStatus"
-    resp = requests.get(url, params=params, timeout=20)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Flow status error: {resp.text}")
-
-    try:
-        return resp.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"Flow status response no-JSON: {resp.text}")
-
+    resp = requests.get(f"{FLOW_API_URL}/payment/getStatus", params=params, timeout=20)
+    return resp.json()
 
 # =========================
-# Email senders
+# Email
 # =========================
-def send_email_via_resend(to_email: str, subject: str, text_body: str):
-    if not RESEND_API_KEY:
-        raise RuntimeError("RESEND_API_KEY no configurada")
-    if not FROM_EMAIL:
-        raise RuntimeError("FROM_EMAIL no configurado (ej: Flujos Digitales <onboarding@resend.dev>)")
-
-    resp = requests.post(
+def send_email_via_resend(to_email, subject, body):
+    r = requests.post(
         "https://api.resend.com/emails",
         headers={
             "Authorization": f"Bearer {RESEND_API_KEY}",
@@ -188,210 +157,92 @@ def send_email_via_resend(to_email: str, subject: str, text_body: str):
             "from": FROM_EMAIL,
             "to": [to_email],
             "subject": subject,
-            "text": text_body,
+            "text": body,
         },
         timeout=20
     )
-    if resp.status_code >= 300:
-        raise RuntimeError(f"Resend error {resp.status_code}: {resp.text}")
+    if r.status_code >= 300:
+        raise RuntimeError(r.text)
 
-def send_email_via_smtp(to_email: str, subject: str, body: str):
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError("SMTP no configurado")
-
-    msg = EmailMessage()
-    msg["From"] = SMTP_USER
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
-
-def send_email(to_email: str, subject: str, body: str):
-    if not to_email:
-        print("[EMAIL] SKIPPED: to_email vacío")
-        return
-
+def send_email(to_email, subject, body):
     try:
         if EMAIL_PROVIDER == "resend":
             send_email_via_resend(to_email, subject, body)
-            print(f"[EMAIL] SENT via RESEND -> {to_email}")
-            return
-
-        # fallback SMTP
-        send_email_via_smtp(to_email, subject, body)
-        print(f"[EMAIL] SENT via SMTP -> {to_email}")
-
+            print(f"[EMAIL] Enviado a {to_email}")
     except Exception as e:
-        # Importante: no romper la confirmación a Flow por error de correo
-        print(f"[EMAIL] FAILED to={to_email} provider={EMAIL_PROVIDER} err={repr(e)}")
-
+        print("[EMAIL ERROR]", e)
 
 # =========================
 # Endpoints
 # =========================
 @app.get("/health")
 def health():
-    smtp_configured = bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
-    resend_configured = bool(RESEND_API_KEY and FROM_EMAIL)
-
     return {
         "ok": True,
-        "service": "flow-backend",
-        "flow_api_url": FLOW_API_URL,
-        "public_base_url": PUBLIC_BASE_URL,
-        "download_base_url": DOWNLOAD_BASE_URL,
-        "has_product_drive_url": bool(PRODUCT_DRIVE_URL),
         "email_provider": EMAIL_PROVIDER,
-        "smtp_configured": smtp_configured,
-        "resend_configured": resend_configured,
+        "resend_configured": bool(RESEND_API_KEY and FROM_EMAIL),
+        "has_product_drive_url": bool(PRODUCT_DRIVE_URL),
     }
-
 
 @app.post("/pay/create")
 async def pay_create(payload: dict):
-    """
-    payload esperado: {"email":"cliente@correo.cl"}
-    Retorna: {"ok":true, "checkoutUrl":"...","token":"..."}
-    """
     email = (payload.get("email") or "").strip().lower()
     if not is_valid_email(email):
-        raise HTTPException(status_code=400, detail="Email inválido o faltante")
+        raise HTTPException(400, "Email inválido")
 
-    if not PUBLIC_BASE_URL:
-        raise HTTPException(
-            status_code=500,
-            detail="PUBLIC_BASE_URL no está configurado (necesario para urlConfirmation/urlReturn públicos)."
-        )
-
-    commerce_order = str(uuid.uuid4())
     order_id = str(uuid.uuid4())
+    commerce_order = str(uuid.uuid4())
 
     params = {
         "commerceOrder": commerce_order,
         "subject": "Pack IA para PYMES 2026",
         "currency": "CLP",
-        "amount": 350,  # <-- precio actual
+        "amount": 350,
         "email": email,
         "urlConfirmation": f"{PUBLIC_BASE_URL}/flow/confirmation",
         "urlReturn": f"{PUBLIC_BASE_URL}/flow/return",
-        "optional": f'{{"orderId":"{order_id}"}}'
     }
 
     data = flow_post("/payment/create", params)
-    flow_token = data["token"]
-    checkout_url = f"{data['url']}?token={flow_token}"
+    token = data["token"]
+    checkout_url = f"{data['url']}?token={token}"
 
-    db_create_order(order_id, email, commerce_order, flow_token)
+    db_create_order(order_id, email, commerce_order, token)
 
-    return {"ok": True, "checkoutUrl": checkout_url, "token": flow_token}
-
+    return {"ok": True, "checkoutUrl": checkout_url, "token": token}
 
 @app.post("/flow/confirmation")
 async def flow_confirmation(request: Request, background_tasks: BackgroundTasks):
-    """
-    Flow POST: token=XXXX (application/x-www-form-urlencoded)
-    Debe responder 200 rápido.
-    """
     form = await request.form()
-    token = str(form.get("token") or "").strip()
-    if not token:
-        return JSONResponse({"ok": False, "error": "missing token"}, status_code=200)
+    token = form.get("token")
 
     status = flow_get_status(token)
-    st = int(status.get("status", 0))  # 1 pendiente, 2 pagada, 3 rechazada, 4 anulada
-
-    order = db_get_by_flow_token(token)
-    if not order:
-        return JSONResponse({"ok": True, "warn": "order_not_found"}, status_code=200)
-
-    _order_id, order_email, _order_status, existing_download_token = order
-
-    if st == 2:
-        if existing_download_token:
-            download_token = existing_download_token
-        else:
-            download_token = uuid.uuid4().hex
+    if int(status.get("status", 0)) == 2:
+        order = db_get_by_flow_token(token)
+        if order:
+            _, email, _, existing_token = order
+            download_token = existing_token or uuid.uuid4().hex
             db_mark_paid(token, download_token)
 
-        # IMPORTANTÍSIMO:
-        # El correo debe llevar TU endpoint, no el Drive directo.
-        download_link = f"{DOWNLOAD_BASE_URL}/download/{download_token}"
+            link = f"{DOWNLOAD_BASE_URL}/download/{download_token}"
+            subject = "Tu Pack IA para PYMES 2026 — Descarga"
+            body = f"Gracias por tu compra.\n\nDescarga aquí:\n{link}"
 
-        mail_subject = "Tu Pack IA para PYMES 2026 — Link de descarga"
-        mail_body = (
-            "¡Gracias por tu compra!\n\n"
-            "Aquí está tu link de descarga:\n"
-            f"{download_link}\n\n"
-            "Si tienes problemas, responde a este correo.\n"
-            "— Flujos Digitales"
-        )
+            background_tasks.add_task(send_email, email, subject, body)
 
-        background_tasks.add_task(send_email, order_email, mail_subject, mail_body)
-
-    return JSONResponse({"ok": True}, status_code=200)
-
+    return JSONResponse({"ok": True})
 
 @app.post("/flow/return")
 async def flow_return(request: Request):
-    """
-    Flow POST via browser a urlReturn con token=...
-    Aquí mostramos estado al cliente (simple).
-    """
-    form = await request.form()
-    token = str(form.get("token") or "").strip()
-    if not token:
-        return JSONResponse({"ok": False, "error": "missing token"}, status_code=200)
-
-    status = flow_get_status(token)
-    st = int(status.get("status", 0))
-
-    if st == 2:
-        return JSONResponse({"ok": True, "message": "Pago confirmado. Revisa tu correo para el link de descarga."})
-    elif st == 1:
-        return JSONResponse({"ok": True, "message": "Pago pendiente. Si fue transferencia/cupón, puede tardar."})
-    else:
-        return JSONResponse({"ok": False, "message": "Pago no completado (rechazado/anulado)."})
-
+    return {"ok": True, "message": "Pago confirmado. Revisa tu correo."}
 
 @app.get("/download/{download_token}")
 def download(download_token: str):
     row = db_get_by_download_token(download_token)
-    if not row:
-        raise HTTPException(status_code=404, detail="Link inválido o expirado")
+    if not row or int(row[1]) != 2:
+        raise HTTPException(403, "Link inválido")
 
-    _email, status, _flow_token = row
-    if int(status) != 2:
-        raise HTTPException(status_code=403, detail="Pago no confirmado")
-
-    # Si hay link de Drive, redirige ahí
     if PRODUCT_DRIVE_URL:
-        return RedirectResponse(url=PRODUCT_DRIVE_URL, status_code=302)
+        return RedirectResponse(PRODUCT_DRIVE_URL)
 
-    # Fallback: descarga archivo local
-    if not os.path.exists(PRODUCT_FILE):
-        raise HTTPException(status_code=500, detail=f"No existe el archivo del producto: {PRODUCT_FILE}")
-
-    return FileResponse(
-        PRODUCT_FILE,
-        media_type="application/zip",
-        filename=os.path.basename(PRODUCT_FILE)
-    )
-
-
-# Debug: probar envío email sin Flow
-@app.get("/debug/test-email")
-def debug_test_email(to: str):
-    to_email = (to or "").strip().lower()
-    if not is_valid_email(to_email):
-        raise HTTPException(status_code=400, detail="Email inválido")
-
-    test_link = f"{DOWNLOAD_BASE_URL}/download/TEST_TOKEN_NO_REAL"
-    subject = "TEST — Flujos Digitales Email"
-    body = f"Prueba de envío.\n\nLink (no real): {test_link}\n"
-
-    send_email(to_email, subject, body)
-    return {"ok": True, "message": f"Intento de envío ejecutado a {to_email}. Revisa Render logs y tu bandeja."}
+    return FileResponse(PRODUCT_FILE, media_type="application/zip")
