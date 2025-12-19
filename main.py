@@ -24,7 +24,7 @@ app = FastAPI(title="flow-backend")
 # =========================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # puedes restringir luego a tu dominio
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -197,7 +197,7 @@ async def pay_create(payload: dict):
         "commerceOrder": commerce_order,
         "subject": "Pack IA para PYMES 2026",
         "currency": "CLP",
-        "amount": 350,
+        "amount": 14990,
         "email": email,
         "urlConfirmation": f"{PUBLIC_BASE_URL}/flow/confirmation",
         "urlReturn": f"{PUBLIC_BASE_URL}/flow/return",
@@ -232,9 +232,11 @@ async def flow_confirmation(request: Request, background_tasks: BackgroundTasks)
 
     return JSONResponse({"ok": True})
 
-@app.post("/flow/return")
+@app.api_route("/flow/return", methods=["GET", "POST"])
 async def flow_return(request: Request):
-    return {"ok": True, "message": "Pago confirmado. Revisa tu correo."}
+    # Flow redirige al usuario a esta URL luego del pago.
+    # Dejamos respuesta simple (puedes redirigir a una página de gracias si quieres).
+    return {"ok": True, "message": "Pago finalizado. Si fue aprobado, revisa tu correo para el link de descarga."}
 
 @app.get("/download/{download_token}")
 def download(download_token: str):
@@ -246,3 +248,14 @@ def download(download_token: str):
         return RedirectResponse(PRODUCT_DRIVE_URL)
 
     return FileResponse(PRODUCT_FILE, media_type="application/zip")
+
+# DEBUG (solo para mi, trato de evitar que render se quede pegado)
+@app.get("/debug/flow")
+def debug_flow():
+    return {
+        "flow_api_url": FLOW_API_URL,
+        "has_api_key": bool(FLOW_API_KEY),
+        "has_secret": bool(FLOW_SECRET_KEY),
+        "public_base_url": PUBLIC_BASE_URL
+    }
+
